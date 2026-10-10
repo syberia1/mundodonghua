@@ -1,0 +1,33 @@
+{
+  "id": "mundodonghua",
+  "name": "Mundo Donghua",
+  "version": "1.0.0",
+  "apiVersion": 6,
+  "entry": "plugin.js",
+  "description": "Donghua subtitulado en español de Mundo Donghua, con los servidores FileMoon, Voe, VidHide y StreamWish.",
+  "author": "tu-usuario-de-github",
+  "hosts": ["mundodonghua.com", "*.mundodonghua.com"],
+  "fetchHosts": "any",
+  "streamHosts": "any",
+  "browser": "pages",
+  "capabilities": ["search", "home", "browse", "episodes", "resolve", "download"],
+  "categories": ["anime"],
+  "discoverable": true,
+  "debug": false,
+  "color": "#F47521",
+  "settings": [
+    {
+      "key": "server",
+      "label": "Servidor preferido",
+      "type": "select",
+      "default": "voe",
+      "hint": "Los demás quedan en el menú Servidor del reproductor.",
+      "options": [
+        { "value": "voe", "label": "Voe" },
+        { "value": "filemoon", "label": "FileMoon" },
+        { "value": "vidhide", "label": "VidHide" },
+        { "value": "streamwish", "label": "StreamWish" }
+      ]
+    }
+  ]
+}
