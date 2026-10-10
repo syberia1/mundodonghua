@@ -196,6 +196,7 @@ async function getPage(url, headers, embed) {
         { "User-Agent": UA, "Accept-Language": "es-ES,es;q=0.9", Accept: "text/html,application/xhtml+xml,*/*" },
         headers || {}
       ),
+      timeoutMs: embed ? 12000 : 9000,
     });
   } catch (e) {
     if (embed) throw e;
@@ -208,7 +209,7 @@ async function getPage(url, headers, embed) {
   }
   if (!embed && kino.browser && typeof kino.browser.page === "function") {
     try {
-      const b = await kino.browser.page(url, { timeoutMs: 12000 });
+      const b = await kino.browser.page(url, { timeoutMs: 8000 });
       if (b && b.html) return { html: b.html, url: b.finalUrl || url };
     } catch (e) {
       kino.log("página oculta falló: " + (e && e.message));
@@ -509,6 +510,13 @@ async function enrichItems(items, cap) {
   });
 }
 
+// Espera a `promise` como mucho `ms` (máximo 5000): la información extra de TMDB nunca debe
+// retrasar ni vaciar una lista. Lo que no alcance a llegar sale en la próxima carga, desde la caché.
+async function within(promise, ms) {
+  promise.catch(() => {});
+  await Promise.race([promise, kino.sleep(Math.min(ms, 5000))]);
+}
+
 // ---------- 5. search, home, browse ----------
 
 export async function search(query) {
@@ -531,7 +539,7 @@ export async function search(query) {
     });
   }
   items = items.slice(0, 50);
-  await enrichItems(items, 8);
+  await within(enrichItems(items, 8), 4000);
   return items;
 }
 
@@ -553,7 +561,6 @@ export async function home() {
       try {
         const items = (await d.load()).slice(0, 40);
         if (!items.length) return null;
-        await enrichItems(items, 8);
         const row = { id: d.id, title: d.title, items };
         if (d.ref) row.ref = d.ref;
         if (d.genre) row.genre = d.genre;
@@ -564,7 +571,12 @@ export async function home() {
       }
     })
   );
-  return rows.filter(Boolean);
+  const shown = rows.filter(Boolean);
+  // Un solo reparto de consultas a TMDB para todo el inicio (tope bajo y tiempo limitado).
+  const everything = [];
+  for (const row of shown) for (const it of row.items) everything.push(it);
+  await within(enrichItems(everything, 12), 5000);
+  return shown;
 }
 
 export async function browse(ref, cursor) {
@@ -572,7 +584,7 @@ export async function browse(ref, cursor) {
   const n = parseInt(cursor, 10);
   const from = n > 0 ? n : 0;
   const items = all.slice(from, from + PAGE_SIZE);
-  await enrichItems(items, 10);
+  await within(enrichItems(items, 10), 4000);
   const out = { items };
   if (from + PAGE_SIZE < all.length) out.next = String(from + PAGE_SIZE);
   return out;
