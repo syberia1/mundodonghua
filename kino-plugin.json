@@ -1,7 +1,7 @@
 {
   "id": "mundodonghua",
   "name": "Mundo Donghua",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiVersion": 6,
   "entry": "plugin.js",
   "description": "Donghua subtitulado en español de Mundo Donghua, con los servidores FileMoon, Voe, VidHide y StreamWish.",

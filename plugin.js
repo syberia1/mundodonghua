@@ -298,6 +298,217 @@ async function mapLimit(list, limit, fn) {
   return out;
 }
 
+// ---------- TMDB: información e imágenes de capítulos ----------
+// Kino pone la llave (kino.tmdb). Si TMDB falla o no encuentra la serie, todo sale igual, sin ese extra.
+
+const TMDB_IMG = "https://image.tmdb.org/t/p/w300";
+const TMDB_BACK = "https://image.tmdb.org/t/p/w780";
+const NO_TMDB = /\b(ova|ovas|especial|especiales|recopilaci[oó]n|recopilado|movie|pel[ií]cula)\b/i;
+
+function cacheGet(key) {
+  try {
+    return kino.storage.get(key);
+  } catch (e) {
+    return null;
+  }
+}
+function cacheSet(key, value, ttlMs) {
+  try {
+    kino.storage.set(key, value, { ttlMs });
+  } catch (e) {
+    /* sin caché */
+  }
+}
+
+// El número al final del título es la temporada del sitio ("Tales of Demons and Gods 10").
+function splitTitle(title) {
+  let season = 1;
+  let base = String(title);
+  let marked = false;
+  let m = /\b(\d+)(?:st|nd|rd|th)\s+season\b/i.exec(base) || /\bseason\s+(\d+)\b/i.exec(base);
+  if (m) {
+    season = parseInt(m[1], 10);
+    base = base.replace(m[0], " ");
+    marked = true;
+  } else {
+    m = /^(.*\D)\s(\d{1,2})$/.exec(base);
+    if (m) {
+      season = parseInt(m[2], 10);
+      base = m[1];
+      marked = true;
+    }
+  }
+  base = base.replace(/\(\d{4}\)/g, " ").replace(/\s+/g, " ").trim();
+  return { base, season, marked };
+}
+
+function pickShow(results) {
+  const list = (results || []).filter((r) => r && r.id);
+  const anim = list.filter((r) => (r.genre_ids || []).indexOf(16) >= 0);
+  const pool = anim.length ? anim : list;
+  const cn = pool.filter((r) => (r.origin_country || []).indexOf("CN") >= 0);
+  return (cn.length ? cn : pool)[0] || null;
+}
+
+async function tmdbSeason(id, season, language) {
+  const d = await kino.tmdb("/tv/" + id + "/season/" + season, { language });
+  return (d && d.episodes) || [];
+}
+
+// Un intento: serie por título, temporada dada. Devuelve { numero: datos } o {}.
+async function tmdbTry(base, season, marked, maxNum) {
+  if (base.length < 2) return {};
+  const found = await kino.tmdb("/search/tv", { query: base, language: "es-MX", include_adult: false });
+  const show = pickShow(found && found.results);
+  if (!show) return {};
+  const eps = await tmdbSeason(show.id, season, "es-MX");
+  const byNum = {};
+  if (!marked && maxNum > eps.length) {
+    // Numeración absoluta (capítulo 527 de una serie sin temporadas en el sitio).
+    const detail = await kino.tmdb("/tv/" + show.id, { language: "es-MX" });
+    const seasons = ((detail && detail.seasons) || []).filter((x) => x.season_number > 0).slice(0, 12);
+    let offset = 0;
+    for (const se of seasons) {
+      const list = se.season_number === season ? eps : await tmdbSeason(show.id, se.season_number, "es-MX");
+      for (const e of list) byNum[offset + e.episode_number] = e;
+      offset += list.length;
+    }
+  } else {
+    for (const e of eps) byNum[e.episode_number] = e;
+    const empty = eps.filter((e) => !e.overview).length;
+    if (eps.length && empty > eps.length / 2) {
+      try {
+        const en = await tmdbSeason(show.id, season, "en-US");
+        for (const e of en) if (byNum[e.episode_number] && !byNum[e.episode_number].overview) byNum[e.episode_number].overview = e.overview;
+      } catch (err) {
+        /* sin respaldo en inglés */
+      }
+    }
+  }
+  const out = {};
+  for (const k of Object.keys(byNum)) {
+    const e = byNum[k];
+    out[k] = {
+      name: String(e.name || "").slice(0, 200),
+      overview: String(e.overview || "").slice(0, 2000),
+      still: e.still_path ? TMDB_IMG + e.still_path : "",
+      air: /^\d{4}-\d{2}-\d{2}$/.test(e.air_date || "") ? e.air_date : "",
+      rt: e.runtime > 0 && e.runtime <= 1000 ? e.runtime : 0,
+    };
+  }
+  return out;
+}
+
+async function tmdbEpisodes(title, maxNum) {
+  const sp = splitTitle(title);
+  const tries = [{ base: sp.base, season: sp.season, marked: sp.marked }];
+  // Si el número final era parte del nombre y no una temporada, se busca el título completo.
+  if (sp.marked) tries.push({ base: String(title).trim(), season: 1, marked: false });
+  for (const tr of tries) {
+    try {
+      const out = await tmdbTry(tr.base, tr.season, tr.marked, maxNum);
+      if (Object.keys(out).length) return out;
+    } catch (e) {
+      if (e && e.code === "rate_limited") throw e;
+    }
+  }
+  return {};
+}
+
+async function episodeExtras(slug, title, maxNum) {
+  if (typeof kino.tmdb !== "function" || NO_TMDB.test(title)) return {};
+  const key = "tmdb1:" + slug;
+  const hit = cacheGet(key);
+  if (hit) {
+    try {
+      return JSON.parse(hit);
+    } catch (e) {
+      /* caché dañada */
+    }
+  }
+  let extras = {};
+  try {
+    extras = await tmdbEpisodes(title, maxNum);
+  } catch (e) {
+    kino.log("tmdb: " + (e && e.message));
+    return {};
+  }
+  const raw = JSON.stringify(extras);
+  if (Object.keys(extras).length && raw.length < 60000) cacheSet(key, raw, 6 * 3600000);
+  return extras;
+}
+
+// Fondo y resumen de cada título de una lista (películas y series).
+async function movieInfo(title) {
+  if (typeof kino.tmdb !== "function") return null;
+  const plain = title.replace(/\bmovie\s*\d*\s*:?\s*/i, " ").replace(/\s+/g, " ").trim();
+  const tries = plain && plain !== title ? [title, plain] : [title];
+  for (const q of tries) {
+    const r = await kino.tmdb("/search/movie", { query: q, language: "es-MX", include_adult: false });
+    const hit = pickShow(r && r.results);
+    if (hit) {
+      return {
+        overview: String(hit.overview || "").slice(0, 700),
+        backdrop: hit.backdrop_path ? TMDB_BACK + hit.backdrop_path : "",
+        year: String(hit.release_date || "").slice(0, 4),
+      };
+    }
+  }
+  return null;
+}
+
+async function seriesInfo(title) {
+  if (typeof kino.tmdb !== "function") return null;
+  const sp = splitTitle(title);
+  const r = await kino.tmdb("/search/tv", { query: sp.base.length >= 2 ? sp.base : title, language: "es-MX", include_adult: false });
+  const hit = pickShow(r && r.results);
+  if (!hit) return null;
+  return {
+    overview: String(hit.overview || "").slice(0, 700),
+    backdrop: hit.backdrop_path ? TMDB_BACK + hit.backdrop_path : "",
+    year: "",
+  };
+}
+
+// Con caché (una semana si hubo datos, un día si no). Lanza si TMDB falla: así no se guarda un "sin datos" falso.
+async function infoFor(item) {
+  const key = (item.kind === "movie" ? "mov1:" : "ser1:") + item.id;
+  const hit = cacheGet(key);
+  if (hit) return hit === "0" ? null : JSON.parse(hit);
+  const info = item.kind === "movie" ? await movieInfo(item.title) : await seriesInfo(item.title);
+  cacheSet(key, info ? JSON.stringify(info) : "0", info ? 7 * 86400000 : 86400000);
+  return info;
+}
+
+function applyInfo(item, info) {
+  if (!info) return;
+  if (info.overview) item.overview = info.overview;
+  if (info.backdrop) item.backdrop = info.backdrop;
+  if (/^\d{4}$/.test(info.year || "")) item.year = info.year;
+}
+
+// Consulta TMDB como mucho `cap` veces nuevas por llamada (límite bajo por plugin); el resto sale de la caché.
+async function enrichItems(items, cap) {
+  let fresh = 0;
+  const todo = [];
+  for (const it of items) {
+    if (NO_TMDB.test(it.title) && it.kind !== "movie") continue;
+    const hit = cacheGet((it.kind === "movie" ? "mov1:" : "ser1:") + it.id);
+    if (hit) applyInfo(it, hit === "0" ? null : JSON.parse(hit));
+    else if (fresh < cap) {
+      fresh++;
+      todo.push(it);
+    }
+  }
+  await mapLimit(todo, 4, async (it) => {
+    try {
+      applyInfo(it, await infoFor(it));
+    } catch (e) {
+      kino.log("sin datos de TMDB: " + (e && e.message));
+    }
+  });
+}
+
 // ---------- 5. search, home, browse ----------
 
 export async function search(query) {
@@ -319,7 +530,9 @@ export async function search(query) {
       return words.every((w) => nt.indexOf(w) >= 0);
     });
   }
-  return items.slice(0, 50);
+  items = items.slice(0, 50);
+  await enrichItems(items, 8);
+  return items;
 }
 
 export async function home() {
@@ -340,6 +553,7 @@ export async function home() {
       try {
         const items = (await d.load()).slice(0, 40);
         if (!items.length) return null;
+        await enrichItems(items, 8);
         const row = { id: d.id, title: d.title, items };
         if (d.ref) row.ref = d.ref;
         if (d.genre) row.genre = d.genre;
@@ -357,7 +571,9 @@ export async function browse(ref, cursor) {
   const all = await listItems(String(ref));
   const n = parseInt(cursor, 10);
   const from = n > 0 ? n : 0;
-  const out = { items: all.slice(from, from + PAGE_SIZE) };
+  const items = all.slice(from, from + PAGE_SIZE);
+  await enrichItems(items, 10);
+  const out = { items };
   if (from + PAGE_SIZE < all.length) out.next = String(from + PAGE_SIZE);
   return out;
 }
@@ -383,12 +599,6 @@ export async function episodes(ref) {
     .slice(0, 2000);
   // Kino numera desde 1: si existe el capítulo 0, todos se muestran +1 (el título y el ref llevan el número real).
   const shift = numbers.length && numbers[0] === 0 ? 1 : 0;
-  const list = numbers.map((n) => ({
-    season: 1,
-    number: n + shift,
-    ref: "e:" + slug + ":" + n,
-    title: t("episode") + n,
-  }));
 
   // Datos de la serie.
   const info = {};
@@ -406,6 +616,32 @@ export async function episodes(ref) {
     if (name && name.length <= 30 && genres.indexOf(name) < 0) genres.push(name);
   }
   if (genres.length && genres.length <= 12) info.genres = genres.slice(0, 5);
+  // Título, resumen, imagen, fecha y duración de cada capítulo (TMDB), con el número real del sitio.
+  const extras = await episodeExtras(slug, info.title || slug.replace(/-/g, " "), numbers.length ? numbers[numbers.length - 1] : 0);
+  const list = numbers.map((n) => {
+    const ep = { season: 1, number: n + shift, ref: "e:" + slug + ":" + n, title: t("episode") + n };
+    const x = extras[n];
+    if (x) {
+      if (x.name && !/^(episode|episodio|cap[ií]tulo)\s*\d+$/i.test(x.name)) ep.title = x.name;
+      if (x.overview) ep.overview = x.overview;
+      if (x.still) ep.still = x.still;
+      if (x.air) ep.airDate = x.air;
+      if (x.rt) ep.runtimeMinutes = x.rt;
+    }
+    return ep;
+  });
+  // Si el sitio no trae sinopsis o fondo, se completan con TMDB.
+  if (!info.overview || !info.backdrop) {
+    try {
+      const extra = await infoFor({ id: slug, kind: "series", title: info.title || slug.replace(/-/g, " ") });
+      if (extra) {
+        if (!info.backdrop && extra.backdrop) info.backdrop = extra.backdrop;
+        if (!info.overview && extra.overview) info.overview = extra.overview;
+      }
+    } catch (e) {
+      kino.log("ficha sin TMDB: " + (e && e.message));
+    }
+  }
   return { series: info, episodes: list };
 }
 
